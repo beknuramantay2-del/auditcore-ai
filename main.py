@@ -181,9 +181,29 @@ async def main():
     print("База данных успешно инициализирована.")
     await dp.start_polling(bot)
 
+import threading
+from http.server import SimpleHTTPRequestHandler, HTTPServer
+
+# Мини веб-сервер для капризного Render
+def run_dummy_server():
+    # Render автоматически передает порт в переменную окружения PORT
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(('0.0.0.0', port), SimpleHTTPRequestHandler)
+    print(f"Запущен заглушка-сервер на порту {port}")
+    server.serve_forever()
+
+async def main():
+    import os
+    await db.init_db()
+    print("База данных успешно инициализирована.")
+    
+    # Запускаем веб-сервер в отдельном потоке, чтобы Render успокоился
+    threading.Thread(target=run_dummy_server, daemon=True).start()
+    
+    await dp.start_polling(bot)
+
 if __name__ == "__main__":
     asyncio.run(main())
-
 
   
         
