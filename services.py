@@ -3,97 +3,111 @@ import json
 import smtplib
 import logging
 import re
+
+from openai import AsyncOpenAI
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
-import google.generativeai as genai
-
 from config import (
-    GEMINI_API_KEY, SMTP_EMAIL, SMTP_PASSWORD,
-    REPORT_EMAIL, CHEATER_SPEED_THRESHOLD
+    OPENAI_API_KEY, SMTP_EMAIL, SMTP_PASSWORD,
+    REPORT_EMAIL, CHEATER_SPEED_THRESHOLD, MAX_TURNS
 )
 
 logger = logging.getLogger(__name__)
-genai.configure(api_key=GEMINI_API_KEY)
+client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-flash_model = genai.GenerativeModel('gemini-2.0-flash')
-pro_model = genai.GenerativeModel('gemini-2.0-flash')
+ROLE_SKILLS = {
+    "Backend Developer": (
+        "Python (алгоритмы, asyncio, декораторы, генераторы), "
+        "REST API design, SQL-оптимизация, ORM, кэширование, Docker"
+    ),
+    "Frontend Developer": (
+        "JavaScript/TypeScript, React (хуки, жизненный цикл, Context/Redux), "
+        "CSS архитектура, производительность браузера, Web APIs, bundlers"
+    ),
+    "Data Analyst": (
+        "SQL (сложные JOIN, оконные функции, CTE), pandas/numpy, "
+        "статистический анализ, визуализация данных, A/B тесты, ETL"
+    ),
+}
 
 # ───────────────────────────────────────────────
-# ГЕНЕРАЦИЯ ВОПРОСА ЧЕРЕЗ GEMINI FLASH
+# ГЕНЕРАЦИЯ ВОПРОСА ЧЕРЕЗ GPT-4o
 # ───────────────────────────────────────────────
 
 async def generate_question(
     role: str,
     language: str,
     turn: int,
-    previous_answer: str = "",
-    timeout: bool = False,
-    transcript: str = ""
+    chat_history: list,
 ) -> dict:
     """
-    Возвращает словарь:
+    chat_history — список сообщений в формате OpenAI:
+    [{"role": "assistant", "content": "..."}, {"role": "user", "content": "..."}, ...]
+    
+    Возвращает:
     {
         "question_text": "...",
         "allowed_time_seconds": 90
     }
     """
-    lang_instruction = "Respond STRICTLY in Russian." if language == "ru" else "Respond STRICTLY in English."
+    lang_rule = (
+        "Веди интервью СТРОГО на русском языке."
+        if language == "ru"
+        else "Conduct the interview STRICTLY in English."
+    )
 
-    role_context = {
-        "Backend Developer": "Python algorithms, API optimization, database queries (SQL), async programming, OOP design",
-        "Frontend Developer": "JavaScript/TypeScript, React architecture, UI/UX logic, CSS optimization, browser APIs",
-        "Data Analyst": "SQL queries, data cleaning logic, pandas/numpy, statistical reasoning, visualization logic"
-    }.get(role, "general programming")
+    skills = ROLE_SKILLS.get(role, "general programming")
 
-    if timeout:
-        context = f"The candidate FAILED to answer in time (timeout). Their previous answer was empty. Give a slightly easier but still practical question."
-    elif previous_answer:
-        context = f"Candidate's previous answer: '''{previous_answer}'''. Analyze it, point out any errors briefly, then ask a sharp follow-up question that tests deeper understanding."
-    else:
-        context = "This is the FIRST question. Start with a practical, realistic coding task."
+    system_prompt = f"""Ты — жёсткий технический интервьюер платформы AuditCore AI.
+Роль кандидата: {role}
+Навыки для проверки: {skills}
+Всего вопросов в интервью: {MAX_TURNS}
+Текущий вопрос: {turn} из {MAX_TURNS}
 
-    prompt = f"""
-You are a strict technical interviewer at AuditCore AI.
-Role being assessed: {role}
-Skills to cover: {role_context}
-Turn number: {turn} of 4
-{lang_instruction}
-{context}
+{lang_rule}
 
-Return ONLY a valid JSON object (no markdown, no code blocks) in this exact format:
+ПРАВИЛА:
+- Каждый вопрос должен быть УНИКАЛЬНЫМ и СТРОГО основан на предыдущем ответе кандидата
+- Никогда не повторяй предыдущие вопросы
+- Задавай ТОЛЬКО практические задачи: найди баг в коде, оптимизируй функцию, напиши SQL-запрос
+- С каждым туром сложность растёт
+- Если кандидат ответил плохо — укажи на ошибку и углубись в ту же тему
+- Если кандидат ответил хорошо — переходи к следующей теме из списка навыков
+- Никогда не давай варианты ответа
+- allowed_time_seconds выбирай динамически: простой вопрос = 45с, средний = 90с, сложный = 120с
+
+Верни ТОЛЬКО валидный JSON без markdown:
 {{
-  "question_text": "your practical question here",
+  "question_text": "текст практического вопроса",
   "allowed_time_seconds": 90
-}}
+}}"""
 
-Rules:
-- allowed_time_seconds must be an integer between 45 and 120
-- Make the question progressively harder each turn
-- No multiple choice. Demand code or detailed explanation.
-- Keep question_text concise but technically deep.
-"""
+    messages = [{"role": "system", "content": system_prompt}] + chat_history
 
     try:
-        response = await flash_model.generate_content_async(prompt)
-        raw = response.text.strip()
-        # Чистим markdown если модель всё равно добавила
-        raw = re.sub(r"```json|```", "", raw).strip()
+        response = await client.chat.completions.create(
+            model="gpt-4o",
+            messages=messages,
+            temperature=0.7,
+            response_format={"type": "json_object"},
+        )
+        raw = response.choices[0].message.content.strip()
         data = json.loads(raw)
         return {
-            "question_text": data.get("question_text", "Explain your approach to this role."),
+            "question_text": data.get("question_text", "Опишите свой подход к решению сложных задач."),
             "allowed_time_seconds": int(data.get("allowed_time_seconds", 90))
         }
     except Exception as e:
-        logger.error(f"Gemini Flash error: {e}")
+        logger.error(f"OpenAI question generation error: {e}")
         return {
-            "question_text": "Describe your most complex technical project and the problems you solved.",
+            "question_text": "Напишите функцию на Python, которая находит все дубликаты в списке за O(n).",
             "allowed_time_seconds": 90
         }
 
 
 # ───────────────────────────────────────────────
-# ФИНАЛЬНЫЙ ОТЧЕТ ЧЕРЕЗ GEMINI PRO
+# ФИНАЛЬНЫЙ ОТЧЕТ ЧЕРЕЗ GPT-4o
 # ───────────────────────────────────────────────
 
 async def generate_final_report(candidate: dict) -> str:
@@ -103,45 +117,50 @@ async def generate_final_report(candidate: dict) -> str:
     role = candidate.get("role", "Unknown")
     name = candidate.get("name", "Unknown")
 
-    prompt = f"""
-Ты — старший HR-аналитик системы AuditCore AI.
-Перед тобой полная стенограмма технического интервью кандидата.
+    prompt = f"""Ты — старший HR-аналитик системы AuditCore AI.
+Перед тобой полная стенограмма технического интервью.
 
-Имя: {name}
+Имя кандидата: {name}
 Роль: {role}
-Количество флагов подозрительной скорости ответа (< {CHEATER_SPEED_THRESHOLD} сек): {suspicious}
-Количество таймаутов (не ответил вовремя): {timeouts}
+Флагов подозрительной скорости (< {CHEATER_SPEED_THRESHOLD} сек): {suspicious}
+Таймаутов (не ответил вовремя): {timeouts}
 
-Стенограмма:
+СТЕНОГРАММА:
 {transcript}
 
-НАПИШИ ПОЛНЫЙ ОТЧЁТ СТРОГО НА РУССКОМ ЯЗЫКЕ в следующем формате:
+Напиши ПОЛНЫЙ ОТЧЁТ СТРОГО НА РУССКОМ ЯЗЫКЕ:
 
----
-ОТЧЁТ AUDITCORE AI
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📋 ОТЧЁТ AUDITCORE AI
 Кандидат: {name}
 Роль: {role}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-1. ОЦЕНКА ТЕХНИЧЕСКИХ НАВЫКОВ (1-10): [число]
-   Обоснование: [3-4 предложения]
+1️⃣ ОЦЕНКА ТЕХНИЧЕСКИХ НАВЫКОВ: [X/10]
+[Детальное обоснование — что знает, чего не знает]
 
-2. ИНДЕКС ЧЕСТНОСТИ (0-100%): [число]%
-   Метрики: Флагов скорости: {suspicious} | Таймаутов: {timeouts}
-   Обоснование: [2-3 предложения]
+2️⃣ ИНДЕКС ЧЕСТНОСТИ: [X%]
+Флагов скорости: {suspicious} | Таймаутов: {timeouts}
+[Анализ поведенческих паттернов — были ли признаки использования ИИ]
 
-3. АНАЛИЗ КОДА И ОТВЕТОВ:
-   [Детальный разбор каждого ответа кандидата: правильность, глубина понимания, качество кода]
+3️⃣ РАЗБОР ОТВЕТОВ ПО КАЖДОМУ ВОПРОСУ:
+[Для каждого вопроса: что спросили → что ответил → оценка ответа]
 
-4. ФИНАЛЬНЫЙ ВЕРДИКТ: [ПРОФЕССИОНАЛ / ПОДОЗРИТЕЛЬНЫЙ / ЧИТЕР / СЛАБЫЙ КАНДИДАТ]
-   Рекомендация HR: [конкретная рекомендация: нанять / отказать / провести очное интервью]
----
-"""
+4️⃣ ФИНАЛЬНЫЙ ВЕРДИКТ: [ПРОФЕССИОНАЛ / ПОДОЗРИТЕЛЬНЫЙ / ЧИТЕР / СЛАБЫЙ КАНДИДАТ]
+
+5️⃣ РЕКОМЕНДАЦИЯ HR:
+[Конкретное действие: нанять / отказать / очное интервью / испытательный срок]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
 
     try:
-        response = await pro_model.generate_content_async(prompt)
-        return response.text
+        response = await client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+        )
+        return response.choices[0].message.content
     except Exception as e:
-        logger.error(f"Gemini Pro error: {e}")
+        logger.error(f"OpenAI report generation error: {e}")
         return f"Ошибка генерации отчёта: {e}"
 
 
@@ -163,8 +182,7 @@ async def send_email_report(candidate: dict, report_text: str):
     msg["From"] = SMTP_EMAIL
     msg["To"] = REPORT_EMAIL
 
-    body = MIMEText(report_text, "plain", "utf-8")
-    msg.attach(body)
+    msg.attach(MIMEText(report_text, "plain", "utf-8"))
 
     try:
         loop = asyncio.get_event_loop()
@@ -177,3 +195,6 @@ def _send_smtp(msg):
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
         server.login(SMTP_EMAIL, SMTP_PASSWORD)
         server.send_message(msg)
+        
+
+    
