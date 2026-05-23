@@ -1,5 +1,5 @@
-aiogram
-openai
-aiosqlite
-aiohttp
-python-dotenv
+aiogram==3.13.1
+groq==0.9.0
+aiosqlite==0.20.0
+pydantic==2.9.2
+pydantic-settings==2.5.2
