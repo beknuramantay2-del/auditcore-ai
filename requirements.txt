@@ -1,4 +1,5 @@
 aiogram
 google-generativeai
-python-dotenv
+aiosqlite
 aiohttp
+python-dotenv
