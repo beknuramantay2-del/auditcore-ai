@@ -1,5 +1,9 @@
+import os
 import asyncio
+import threading
 from datetime import datetime
+from http.server import SimpleHTTPRequestHandler, HTTPServer
+
 from aiogram import Bot, Dispatcher, html, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -106,7 +110,6 @@ async def interview_timer(tg_id: int, state: FSMContext, turn_idx: int, delay: i
     if current_state == InterviewForm.in_interview:
         state_data = await state.get_data()
         if state_data.get("turn_idx") == turn_idx:
-            # Юзер не успел. Форсируем таймаут
             lang = state_data["language"]
             await bot.send_message(tg_id, LOCALIZATION[lang]["timeout"])
             await next_interview_turn(tg_id, "TIMEOUT_EVENT_NO_ANSWER", state)
@@ -121,35 +124,28 @@ async def next_interview_turn(tg_id: int, last_answer: str, state: FSMContext):
     lang = data["language"]
     role = data["role"]
     
-    # Сохраняем предыдущий шаг в историю, если это не старт
     if last_answer != "START_INTERVIEW":
         last_q = data.get("current_question", "")
         await db.log_turn(tg_id, last_q, last_answer)
     
-    # Получаем всю историю текущей сессии
     history_text = await db.get_transcript(tg_id)
     if last_answer == "TIMEOUT_EVENT_NO_ANSWER":
         history_text += f"System: Candidate ran out of time on the question below.\n"
 
-    # Обращаемся к Groq
     ai_turn = ai.get_ai_question(role, lang, history_text)
     
     if ai_turn.is_interview_finished:
         await bot.send_message(tg_id, LOCALIZATION[lang]["thanks"])
-        # Сборка финального отчета на русском через Groq Llama 3.1
         final_transcript = await db.get_transcript(tg_id)
         report = ai.generate_final_report_ru(data["fullname"], role, final_transcript)
         
-        # Отправка отчета на monkifani@gmail.com
         ai.send_email_report(data["fullname"], role, report)
         await state.clear()
         return
 
-    # Обновляем индекс раунда для работы таймера
     new_turn_idx = data.get("turn_idx", 0) + 1
     await state.update_data(current_question=ai_turn.question_text, turn_idx=new_turn_idx)
     
-    # Отправляем вопрос и запускаем серверный таймер контроля времени
     time_label = "сек." if lang == "ru" else "sec."
     msg_text = f"{ai_turn.question_text}\n\n⏱ [{ai_turn.allowed_time_seconds} {time_label}]"
     await bot.send_message(tg_id, msg_text)
@@ -159,7 +155,6 @@ async def next_interview_turn(tg_id: int, last_answer: str, state: FSMContext):
 
 @dp.message(InterviewForm.in_interview)
 async def handle_answer(message: Message, state: FSMContext):
-    # Кандидат успел ответить. Переходим к следующему шагу
     await next_interview_turn(message.from_user.id, message.text, state)
 
 @dp.message(Command("admin"))
@@ -176,34 +171,21 @@ async def cmd_admin(message: Message):
         response += f"👤 {c[1]} ({c[2]})\nРоль: {c[3]} | Статус: {c[4]}\n`ID: {c[0]}`\n\n"
     await message.answer(response)
 
-async def main():
-    await db.init_db()
-    print("База данных успешно инициализирована.")
-    await dp.start_polling(bot)
-
-import threading
-from http.server import SimpleHTTPRequestHandler, HTTPServer
-
-# Мини веб-сервер для капризного Render
+# Функция заглушки-сервера для Render (теперь с импортированным os)
 def run_dummy_server():
-    # Render автоматически передает порт в переменную окружения PORT
     port = int(os.environ.get("PORT", 10000))
     server = HTTPServer(('0.0.0.0', port), SimpleHTTPRequestHandler)
-    print(f"Запущен заглушка-сервер на порту {port}")
+    print(f"Заглушка-сервер успешно слушает порт {port}")
     server.serve_forever()
 
 async def main():
-    import os
     await db.init_db()
     print("База данных успешно инициализирована.")
     
-    # Запускаем веб-сервер в отдельном потоке, чтобы Render успокоился
+    # Запускаем сервер в фоновом потоке
     threading.Thread(target=run_dummy_server, daemon=True).start()
     
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-  
-        
