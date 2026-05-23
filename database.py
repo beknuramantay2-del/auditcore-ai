@@ -1,67 +1,58 @@
 import aiosqlite
-
-DB_PATH = "auditcore.db"
+from config import settings
 
 async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute('''
+    async with aiosqlite.connect(settings.DATABASE_PATH) as db:
+        # Таблица кандидатов и их сессий
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS candidates (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                tg_id INTEGER UNIQUE,
-                language TEXT DEFAULT 'ru',
-                name TEXT,
+                tg_id INTEGER PRIMARY KEY,
+                fullname TEXT,
                 email TEXT,
                 role TEXT,
-                turn_count INTEGER DEFAULT 0,
-                suspicious_count INTEGER DEFAULT 0,
-                timeout_count INTEGER DEFAULT 0,
-                transcript TEXT DEFAULT '',
-                final_verdict TEXT DEFAULT '',
+                language TEXT,
                 status TEXT DEFAULT 'in_progress',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
-        ''')
+        """)
+        # Таблица логов диалога
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS interview_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tg_id INTEGER,
+                role_prompt TEXT,
+                user_answer TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         await db.commit()
 
-async def insert_candidate(tg_id: int, language: str):
-    async with aiosqlite.connect(DB_PATH) as db:
+async def save_candidate(tg_id: int, fullname: str, email: str, role: str, language: str):
+    async with aiosqlite.connect(settings.DATABASE_PATH) as db:
         await db.execute(
-            "INSERT OR IGNORE INTO candidates (tg_id, language) VALUES (?, ?)",
-            (tg_id, language)
+            "INSERT OR REPLACE INTO candidates (tg_id, fullname, email, role, language) VALUES (?, ?, ?, ?, ?)",
+            (tg_id, fullname, email, role, language)
         )
         await db.commit()
 
-async def upsert_candidate(tg_id: int, **kwargs):
-    if not kwargs:
-        return
-    fields = ", ".join(f"{k} = ?" for k in kwargs)
-    values = list(kwargs.values()) + [tg_id]
-    async with aiosqlite.connect(DB_PATH) as db:
+async def log_turn(tg_id: int, role_prompt: str, user_answer: str):
+    async with aiosqlite.connect(settings.DATABASE_PATH) as db:
         await db.execute(
-            f"UPDATE candidates SET {fields} WHERE tg_id = ?", values
+            "INSERT INTO interview_logs (tg_id, role_prompt, user_answer) VALUES (?, ?, ?)",
+            (tg_id, role_prompt, user_answer)
         )
         await db.commit()
 
-async def get_candidate(tg_id: int) -> dict | None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT * FROM candidates WHERE tg_id = ?", (tg_id,)
-        ) as cursor:
-            row = await cursor.fetchone()
-            return dict(row) if row else None
-
-async def get_all_candidates() -> list[dict]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM candidates") as cursor:
+async def get_transcript(tg_id: int) -> str:
+    async with aiosqlite.connect(settings.DATABASE_PATH) as db:
+        async with db.execute("SELECT role_prompt, user_answer FROM interview_logs WHERE tg_id = ? ORDER BY id ASC", (tg_id,)) as cursor:
             rows = await cursor.fetchall()
-            return [dict(r) for r in rows]
+            transcript = ""
+            for row in rows:
+                transcript += f"Бот: {row[0]}\nКандидат: {row[1]}\n\n"
+            return transcript
 
-async def append_transcript(tg_id: int, text: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE candidates SET transcript = transcript || ? WHERE tg_id = ?",
-            (text + "\n", tg_id)
-        )
-        await db.commit()
+async def get_all_candidates():
+    async with aiosqlite.connect(settings.DATABASE_PATH) as db:
+        async with db.execute("SELECT tg_id, fullname, email, role, status FROM candidates") as cursor:
+            return await cursor.fetchall()
