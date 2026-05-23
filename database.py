@@ -23,20 +23,22 @@ async def init_db():
         ''')
         await db.commit()
 
-async def upsert_candidate(tg_id: int, **kwargs):
-    fields = ", ".join(f"{k} = ?" for k in kwargs)
-    values = list(kwargs.values()) + [tg_id]
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            f"UPDATE candidates SET {fields} WHERE tg_id = ?", values
-        )
-        await db.commit()
-
 async def insert_candidate(tg_id: int, language: str):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "INSERT OR IGNORE INTO candidates (tg_id, language) VALUES (?, ?)",
             (tg_id, language)
+        )
+        await db.commit()
+
+async def upsert_candidate(tg_id: int, **kwargs):
+    if not kwargs:
+        return
+    fields = ", ".join(f"{k} = ?" for k in kwargs)
+    values = list(kwargs.values()) + [tg_id]
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            f"UPDATE candidates SET {fields} WHERE tg_id = ?", values
         )
         await db.commit()
 
