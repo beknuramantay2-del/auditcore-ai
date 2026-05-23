@@ -10,14 +10,14 @@ from aiogram.types import (
     Message, CallbackQuery,
     InlineKeyboardMarkup, InlineKeyboardButton,
     ReplyKeyboardMarkup, KeyboardButton,
-    ReplyKeyboardRemove
+    ReplyKeyboardRemove, BufferedInputFile
 )
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.enums import ParseMode
 
-from config import TELEGRAM_TOKEN, ADMIN_ID, PORT, MAX_TURNS
+from config import TELEGRAM_TOKEN, ADMIN_ID, PORT, MAX_TURNS, CHEATER_SPEED_THRESHOLD
 from database import (
     init_db, insert_candidate, upsert_candidate,
     get_candidate, get_all_candidates, append_transcript
@@ -31,11 +31,12 @@ bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 router = Router()
 
-# Хранилище активных таймеров { tg_id: asyncio.Task }
+# Хранилище таймеров и истории диалогов
 active_timers: dict[int, asyncio.Task] = {}
+chat_histories: dict[int, list] = {}  # tg_id -> [{"role": ..., "content": ...}]
 
 # ───────────────────────────────────────────────
-# FSM СОСТОЯНИЯ
+# FSM
 # ───────────────────────────────────────────────
 
 class Flow(StatesGroup):
@@ -47,89 +48,112 @@ class Flow(StatesGroup):
     interviewing      = State()
 
 # ───────────────────────────────────────────────
-# ТЕКСТЫ НА ДВУХ ЯЗЫКАХ
+# ТЕКСТЫ
 # ───────────────────────────────────────────────
 
 TEXTS = {
     "ru": {
-        "welcome":       "👋 Добро пожаловать в <b>AuditCore AI</b>!\nВыберите язык интервью:",
-        "enter_name":    "Введите ваше <b>полное имя (ФИО)</b>:",
-        "enter_email":   "Введите ваш <b>Email</b>:",
-        "choose_role":   "Выберите роль, на которую претендуете:",
-        "onboarding":    (
-            "✅ Регистрация завершена!\n\n"
-            "⚠️ <b>Правила SkillPass:</b>\n"
-            "• ИИ-асессор задаёт 4 практических вопроса\n"
-            "• На каждый вопрос — строгий таймер (45–120 сек)\n"
-            "• Слишком быстрые ответы фиксируются как подозрительные\n"
-            "• По окончании HR получает полный аналитический отчёт\n\n"
-            "Готовы?"
+        "welcome":          "👋 Добро пожаловать в <b>AuditCore AI</b>!\n\nВыберите язык интервью:",
+        "enter_name":       "✏️ Введите ваше <b>полное имя (ФИО)</b>:",
+        "enter_email":      "📧 Введите ваш <b>Email</b>:",
+        "choose_role":      "💼 Выберите роль, на которую претендуете:",
+        "onboarding":       (
+            "✅ <b>Регистрация завершена!</b>\n\n"
+            "📋 <b>Правила SkillPass:</b>\n"
+            "• ИИ-асессор задаст вам <b>4 практических вопроса</b>\n"
+            "• Каждый вопрос адаптируется под ваш предыдущий ответ\n"
+            "• На каждый вопрос — строгий таймер (<b>45–120 сек</b>)\n"
+            "• Аномально быстрые ответы автоматически фиксируются\n"
+            "• По окончании HR получит полный аналитический отчёт\n\n"
+            "Когда будете готовы — нажмите кнопку ниже:"
         ),
-        "start_btn":     "🚀 Начать SkillPass",
-        "thinking":      "⏳ ИИ-асессор готовит вопрос...",
-        "question_header": "❓ <b>Вопрос {turn} из {max}:</b>\n⏱ Время на ответ: <b>{time} сек</b>\n\n{question}",
-        "timeout_msg":   "⏰ <b>Время вышло!</b> Ответ не засчитан. Перехожу к следующему вопросу...",
-        "processing":    "🔄 Обрабатываю ваш ответ...",
-        "finished":      "🏁 <b>Интервью завершено!</b>\n\nВаши результаты анализируются ИИ. Отчёт уже направлен в HR-департамент.\n\nСпасибо за участие в SkillPass!",
-        "cheater_flag":  "⚡ Скорость ответа зафиксирована системой.",
+        "start_btn":        "🚀 Начать SkillPass",
+        "thinking":         "⏳ ИИ-асессор анализирует и готовит следующий вопрос...",
+        "q_header":         "❓ <b>Вопрос {turn} из {max}</b>\n⏱ Время на ответ: <b>{time} сек</b>\n\n{question}",
+        "timeout":          "⏰ <b>Время вышло!</b> Ответ не засчитан. Перехожу к следующему вопросу...",
+        "processing":       "🔄 Обрабатываю ваш ответ...",
+        "speed_flag":       "⚡ Скорость ответа зафиксирована системой мониторинга.",
+        "finished":         (
+            "🏁 <b>Интервью завершено!</b>\n\n"
+            "Ваши результаты анализируются ИИ-системой.\n"
+            "Полный отчёт уже направлен в HR-департамент.\n\n"
+            "Спасибо за участие в AuditCore SkillPass!"
+        ),
     },
     "en": {
-        "welcome":       "👋 Welcome to <b>AuditCore AI</b>!\nPlease choose your interview language:",
-        "enter_name":    "Enter your <b>Full Name</b>:",
-        "enter_email":   "Enter your <b>Email</b>:",
-        "choose_role":   "Select the role you are applying for:",
-        "onboarding":    (
-            "✅ Registration complete!\n\n"
-            "⚠️ <b>SkillPass Rules:</b>\n"
-            "• The AI assessor will ask 4 practical questions\n"
-            "• Each question has a strict timer (45–120 sec)\n"
-            "• Suspiciously fast answers are flagged automatically\n"
+        "welcome":          "👋 Welcome to <b>AuditCore AI</b>!\n\nPlease choose your interview language:",
+        "enter_name":       "✏️ Enter your <b>Full Name</b>:",
+        "enter_email":      "📧 Enter your <b>Email</b>:",
+        "choose_role":      "💼 Select the role you are applying for:",
+        "onboarding":       (
+            "✅ <b>Registration complete!</b>\n\n"
+            "📋 <b>SkillPass Rules:</b>\n"
+            "• The AI assessor will ask you <b>4 practical questions</b>\n"
+            "• Each question adapts based on your previous answer\n"
+            "• Each question has a strict timer (<b>45–120 sec</b>)\n"
+            "• Suspiciously fast answers are automatically flagged\n"
             "• After the session, HR receives a full analytical report\n\n"
-            "Ready?"
+            "When ready — press the button below:"
         ),
-        "start_btn":     "🚀 Start SkillPass",
-        "thinking":      "⏳ AI assessor is preparing your question...",
-        "question_header": "❓ <b>Question {turn} of {max}:</b>\n⏱ Time allowed: <b>{time} sec</b>\n\n{question}",
-        "timeout_msg":   "⏰ <b>Time is up!</b> No answer recorded. Moving to the next question...",
-        "processing":    "🔄 Processing your answer...",
-        "finished":      "🏁 <b>Interview complete!</b>\n\nYour results are being analyzed. The report has been sent to HR.\n\nThank you for completing SkillPass!",
-        "cheater_flag":  "⚡ Response speed has been logged by the system.",
+        "start_btn":        "🚀 Start SkillPass",
+        "thinking":         "⏳ AI assessor is analyzing and preparing the next question...",
+        "q_header":         "❓ <b>Question {turn} of {max}</b>\n⏱ Time allowed: <b>{time} sec</b>\n\n{question}",
+        "timeout":          "⏰ <b>Time is up!</b> No answer recorded. Moving to the next question...",
+        "processing":       "🔄 Processing your answer...",
+        "speed_flag":       "⚡ Your response speed has been logged by the monitoring system.",
+        "finished":         (
+            "🏁 <b>Interview complete!</b>\n\n"
+            "Your results are being analyzed by the AI system.\n"
+            "The full report has been sent to HR.\n\n"
+            "Thank you for completing AuditCore SkillPass!"
+        ),
     }
 }
 
-def t(lang: str, key: str) -> str:
-    return TEXTS.get(lang, TEXTS["ru"]).get(key, "")
+def t(lang: str, key: str, **kwargs) -> str:
+    text = TEXTS.get(lang, TEXTS["ru"]).get(key, "")
+    return text.format(**kwargs) if kwargs else text
 
 # ───────────────────────────────────────────────
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# КЛАВИАТУРЫ
 # ───────────────────────────────────────────────
 
-def lang_keyboard() -> InlineKeyboardMarkup:
+def lang_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="🇷🇺 Русский", callback_data="lang_ru"),
-        InlineKeyboardButton(text="🇬🇧 English", callback_data="lang_en"),
+        InlineKeyboardButton(text="🇬🇧 English",  callback_data="lang_en"),
     ]])
 
-def role_keyboard(lang: str) -> InlineKeyboardMarkup:
-    roles = ["Backend Developer", "Frontend Developer", "Data Analyst"]
+def role_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=r, callback_data=f"role_{r}")] for r in roles
+        [InlineKeyboardButton(text="⚙️ Backend Developer",  callback_data="role_Backend Developer")],
+        [InlineKeyboardButton(text="🎨 Frontend Developer", callback_data="role_Frontend Developer")],
+        [InlineKeyboardButton(text="📊 Data Analyst",       callback_data="role_Data Analyst")],
     ])
 
-def start_keyboard(lang: str) -> ReplyKeyboardMarkup:
+def start_kb(lang: str) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text=t(lang, "start_btn"))]],
-        resize_keyboard=True
+        resize_keyboard=True,
+        one_time_keyboard=True
     )
+
+# ───────────────────────────────────────────────
+# ТАЙМЕР И ЛОГИКА ИНТЕРВЬЮ
+# ───────────────────────────────────────────────
 
 async def cancel_timer(tg_id: int):
     task = active_timers.pop(tg_id, None)
     if task and not task.done():
         task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 async def finish_interview(tg_id: int, chat_id: int, state: FSMContext):
-    """Финализация интервью: генерация отчёта и отправка email."""
     await cancel_timer(tg_id)
+    chat_histories.pop(tg_id, None)
     await state.clear()
 
     candidate = await get_candidate(tg_id)
@@ -137,23 +161,22 @@ async def finish_interview(tg_id: int, chat_id: int, state: FSMContext):
 
     await bot.send_message(chat_id, t(lang, "finished"), parse_mode=ParseMode.HTML)
 
-    # Генерируем отчёт
+    # Генерируем финальный отчёт
     report = await generate_final_report(candidate)
-
-    # Сохраняем вердикт в БД
     await upsert_candidate(tg_id, final_verdict=report, status="completed")
 
-    # Отправляем email
+    # Email
     await send_email_report(candidate, report)
 
-    # Дублируем отчёт администратору в Telegram
+    # Дублируем в Telegram администратору
+    short_report = report[:3800] if len(report) > 3800 else report
     admin_msg = (
         f"🚨 <b>Новый отчёт AuditCore AI</b>\n\n"
-        f"👤 {candidate.get('name')} | {candidate.get('role')}\n"
-        f"📧 {candidate.get('email')}\n"
-        f"⚠️ Флагов скорости: {candidate.get('suspicious_count', 0)} | "
-        f"Таймаутов: {candidate.get('timeout_count', 0)}\n\n"
-        f"{report[:3500]}"
+        f"👤 <b>{candidate.get('name', '?')}</b> | {candidate.get('role', '?')}\n"
+        f"📧 {candidate.get('email', '?')}\n"
+        f"⚠️ Флагов скорости: <b>{candidate.get('suspicious_count', 0)}</b> | "
+        f"Таймаутов: <b>{candidate.get('timeout_count', 0)}</b>\n\n"
+        f"{short_report}"
     )
     try:
         await bot.send_message(ADMIN_ID, admin_msg, parse_mode=ParseMode.HTML)
@@ -161,51 +184,72 @@ async def finish_interview(tg_id: int, chat_id: int, state: FSMContext):
         logger.error(f"Ошибка отправки отчёта админу: {e}")
 
 
-async def run_turn(tg_id: int, chat_id: int, state: FSMContext,
-                   previous_answer: str = "", timeout: bool = False):
-    """Один цикл интервью: запрос вопроса у Gemini → отправка → запуск таймера."""
+async def run_turn(
+    tg_id: int,
+    chat_id: int,
+    state: FSMContext,
+    previous_answer: str = "",
+    is_timeout: bool = False
+):
     candidate = await get_candidate(tg_id)
-    lang = candidate.get("language", "ru")
-    role = candidate.get("role", "Backend Developer")
-    turn = candidate.get("turn_count", 0) + 1
-    transcript = candidate.get("transcript", "")
+    lang  = candidate.get("language", "ru")
+    role  = candidate.get("role", "Backend Developer")
+    turn  = candidate.get("turn_count", 0) + 1
 
     if turn > MAX_TURNS:
         await finish_interview(tg_id, chat_id, state)
         return
 
     await upsert_candidate(tg_id, turn_count=turn)
+
+    # Обновляем историю диалога для GPT
+    history = chat_histories.setdefault(tg_id, [])
+
+    if is_timeout:
+        history.append({
+            "role": "user",
+            "content": "[ТАЙМАУТ: кандидат не успел ответить. Дай новый, чуть более простой вопрос.]"
+        })
+    elif previous_answer:
+        history.append({
+            "role": "user",
+            "content": previous_answer
+        })
+
     await bot.send_message(chat_id, t(lang, "thinking"))
 
+    # Запрашиваем вопрос у GPT с полным контекстом истории
     q_data = await generate_question(
         role=role,
         language=lang,
         turn=turn,
-        previous_answer=previous_answer,
-        timeout=timeout,
-        transcript=transcript
+        chat_history=history,
     )
 
     question_text = q_data["question_text"]
     allowed_time  = q_data["allowed_time_seconds"]
 
-    # Логируем в транскрипт
+    # Добавляем вопрос бота в историю
+    history.append({"role": "assistant", "content": question_text})
+
+    # Логируем в транскрипт БД
     await append_transcript(
         tg_id,
-        f"[Q{turn}] БОТ (лимит {allowed_time}с): {question_text}"
+        f"[ВОПРОС {turn}/{MAX_TURNS}] (лимит {allowed_time}с):\n{question_text}"
     )
 
-    header = t(lang, "question_header").format(
-        turn=turn, max=MAX_TURNS,
-        time=allowed_time, question=question_text
+    await bot.send_message(
+        chat_id,
+        t(lang, "q_header", turn=turn, max=MAX_TURNS,
+          time=allowed_time, question=question_text),
+        parse_mode=ParseMode.HTML
     )
-    await bot.send_message(chat_id, header, parse_mode=ParseMode.HTML)
 
-    # Сохраняем время отправки вопроса в FSM
+    # Сохраняем время отправки вопроса
     await state.update_data(q_sent_at=time.time(), allowed_time=allowed_time)
     await state.set_state(Flow.interviewing)
 
-    # Запускаем таймер
+    # Запускаем фоновый таймер
     await cancel_timer(tg_id)
     task = asyncio.create_task(
         _timeout_task(tg_id, chat_id, state, allowed_time, lang)
@@ -215,25 +259,31 @@ async def run_turn(tg_id: int, chat_id: int, state: FSMContext,
 
 async def _timeout_task(tg_id: int, chat_id: int, state: FSMContext,
                          allowed_time: int, lang: str):
-    """Фоновый таймер. Срабатывает если кандидат не ответил вовремя."""
     await asyncio.sleep(allowed_time)
 
-    current_state = await state.get_state()
-    if current_state != Flow.interviewing.state:
+    # Проверяем что кандидат всё ещё в состоянии интервью
+    current = await state.get_state()
+    if current != Flow.interviewing.state:
         return
 
-    await append_transcript(tg_id, "[СИСТЕМА] ТАЙМАУТ — кандидат не ответил вовремя.")
-    await upsert_candidate(tg_id,
-        timeout_count=(await get_candidate(tg_id)).get("timeout_count", 0) + 1
+    logger.info(f"TIMEOUT for tg_id={tg_id}")
+
+    await append_transcript(
+        tg_id,
+        f"[СИСТЕМА] ⏰ ТАЙМАУТ — кандидат не ответил за {allowed_time} секунд."
     )
 
-    await bot.send_message(chat_id, t(lang, "timeout_msg"), parse_mode=ParseMode.HTML)
+    candidate = await get_candidate(tg_id)
+    new_timeouts = candidate.get("timeout_count", 0) + 1
+    await upsert_candidate(tg_id, timeout_count=new_timeouts)
+
+    await bot.send_message(chat_id, t(lang, "timeout"), parse_mode=ParseMode.HTML)
 
     candidate = await get_candidate(tg_id)
     if candidate.get("turn_count", 0) >= MAX_TURNS:
         await finish_interview(tg_id, chat_id, state)
     else:
-        await run_turn(tg_id, chat_id, state, previous_answer="", timeout=True)
+        await run_turn(tg_id, chat_id, state, is_timeout=True)
 
 # ───────────────────────────────────────────────
 # ХЭНДЛЕРЫ
@@ -241,11 +291,14 @@ async def _timeout_task(tg_id: int, chat_id: int, state: FSMContext,
 
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
+    tg_id = message.from_user.id
     await state.clear()
-    await cancel_timer(message.from_user.id)
+    await cancel_timer(tg_id)
+    chat_histories.pop(tg_id, None)
+
     await message.answer(
         t("ru", "welcome"),
-        reply_markup=lang_keyboard(),
+        reply_markup=lang_kb(),
         parse_mode=ParseMode.HTML
     )
     await state.set_state(Flow.choosing_language)
@@ -253,7 +306,7 @@ async def cmd_start(message: Message, state: FSMContext):
 
 @router.callback_query(Flow.choosing_language, F.data.startswith("lang_"))
 async def cb_language(call: CallbackQuery, state: FSMContext):
-    lang = call.data.split("_")[1]
+    lang  = call.data.split("_")[1]
     tg_id = call.from_user.id
 
     await insert_candidate(tg_id, lang)
@@ -283,7 +336,7 @@ async def process_email(message: Message, state: FSMContext):
     await upsert_candidate(tg_id, email=message.text.strip())
     await message.answer(
         t(lang, "choose_role"),
-        reply_markup=role_keyboard(lang),
+        reply_markup=role_kb(),
         parse_mode=ParseMode.HTML
     )
     await state.set_state(Flow.choosing_role)
@@ -291,7 +344,7 @@ async def process_email(message: Message, state: FSMContext):
 
 @router.callback_query(Flow.choosing_role, F.data.startswith("role_"))
 async def cb_role(call: CallbackQuery, state: FSMContext):
-    role = call.data[5:]
+    role  = call.data[5:]
     tg_id = call.from_user.id
     candidate = await get_candidate(tg_id)
     lang = candidate.get("language", "ru") if candidate else "ru"
@@ -300,7 +353,7 @@ async def cb_role(call: CallbackQuery, state: FSMContext):
     await call.message.edit_reply_markup(reply_markup=None)
     await call.message.answer(
         t(lang, "onboarding"),
-        reply_markup=start_keyboard(lang),
+        reply_markup=start_kb(lang),
         parse_mode=ParseMode.HTML
     )
     await state.set_state(Flow.ready_to_start)
@@ -308,65 +361,66 @@ async def cb_role(call: CallbackQuery, state: FSMContext):
 
 
 @router.message(Flow.ready_to_start)
-async def handle_start_skillpass(message: Message, state: FSMContext):
+async def handle_start_btn(message: Message, state: FSMContext):
     tg_id = message.from_user.id
     candidate = await get_candidate(tg_id)
     lang = candidate.get("language", "ru") if candidate else "ru"
 
-    btn = t(lang, "start_btn")
-    if message.text != btn:
+    if message.text != t(lang, "start_btn"):
         return
 
-    await message.answer("...", reply_markup=ReplyKeyboardRemove())
+    await message.answer("▶️", reply_markup=ReplyKeyboardRemove())
     await run_turn(tg_id, message.chat.id, state)
 
 
 @router.message(Flow.interviewing)
 async def handle_answer(message: Message, state: FSMContext):
-    tg_id = message.from_user.id
+    tg_id       = message.from_user.id
     answer_time = time.time()
 
+    # Отменяем таймер т.к. кандидат ответил вовремя
     await cancel_timer(tg_id)
 
-    fsm_data = await state.get_data()
+    fsm_data     = await state.get_data()
     q_sent_at    = fsm_data.get("q_sent_at", answer_time)
     allowed_time = fsm_data.get("allowed_time", 90)
     delta        = round(answer_time - q_sent_at, 1)
 
     candidate = await get_candidate(tg_id)
-    lang = candidate.get("language", "ru") if candidate else "ru"
-    turn = candidate.get("turn_count", 1)
+    lang  = candidate.get("language", "ru") if candidate else "ru"
+    turn  = candidate.get("turn_count", 1)
 
     # Логируем ответ
-    log_line = f"[A{turn}] КАНДИДАТ ({delta}с): {message.text}"
-    await append_transcript(tg_id, log_line)
+    await append_transcript(
+        tg_id,
+        f"[ОТВЕТ {turn}/{MAX_TURNS}] (за {delta}с из {allowed_time}с):\n{message.text}"
+    )
 
     # Проверяем на подозрительную скорость
-    from config import CHEATER_SPEED_THRESHOLD
     if delta < CHEATER_SPEED_THRESHOLD:
         await append_transcript(
             tg_id,
-            f"[СИСТЕМА] ⚠️ ФЛАГ СКОРОСТИ: ответ за {delta}с (порог {CHEATER_SPEED_THRESHOLD}с)"
+            f"[СИСТЕМА] ⚠️ ФЛАГ СКОРОСТИ: ответ за {delta}с "
+            f"(порог {CHEATER_SPEED_THRESHOLD}с) — возможное использование ИИ"
         )
         new_suspicious = candidate.get("suspicious_count", 0) + 1
         await upsert_candidate(tg_id, suspicious_count=new_suspicious)
-        await message.answer(t(lang, "cheater_flag"))
+        await message.answer(t(lang, "speed_flag"))
 
     await message.answer(t(lang, "processing"))
 
-    # Проверяем, завершено ли интервью
+    # Завершаем или продолжаем
     if turn >= MAX_TURNS:
         await finish_interview(tg_id, message.chat.id, state)
-        return
-
-    await run_turn(
-        tg_id, message.chat.id, state,
-        previous_answer=message.text
-    )
+    else:
+        await run_turn(
+            tg_id, message.chat.id, state,
+            previous_answer=message.text
+        )
 
 
 # ───────────────────────────────────────────────
-# ADMIN КОМАНДА
+# ADMIN
 # ───────────────────────────────────────────────
 
 @router.message(Command("admin"))
@@ -377,49 +431,57 @@ async def cmd_admin(message: Message):
 
     candidates = await get_all_candidates()
     if not candidates:
-        await message.answer("База данных пуста.")
+        await message.answer("📭 База данных пуста.")
         return
 
-    # Генерируем CSV в памяти
-    output = io.StringIO()
-    writer = csv.DictWriter(
-        output,
-        fieldnames=["id","tg_id","name","email","role","language",
-                    "turn_count","suspicious_count","timeout_count",
-                    "status","created_at"]
-    )
-    writer.writeheader()
+    # Текстовая сводка
+    summary = "📊 <b>AuditCore AI — Все кандидаты</b>\n" + "─" * 30 + "\n"
     for c in candidates:
-        writer.writerow({k: c.get(k, "") for k in writer.fieldnames})
-
-    output.seek(0)
-    csv_bytes = output.getvalue().encode("utf-8")
-
-    # Краткая сводка
-    summary = "📊 <b>AuditCore AI — База кандидатов</b>\n\n"
-    for c in candidates:
+        verdict_line = ""
+        if c.get("final_verdict"):
+            lines = c["final_verdict"].split("\n")
+            for line in lines:
+                if "ВЕРДИКТ" in line or "VERDICT" in line:
+                    verdict_line = line.strip()
+                    break
         summary += (
-            f"👤 {c.get('name','?')} | {c.get('role','?')} | "
-            f"Статус: {c.get('status','?')} | "
-            f"Флаги: {c.get('suspicious_count',0)} | "
+            f"\n👤 <b>{c.get('name','?')}</b> | {c.get('role','?')}\n"
+            f"   📧 {c.get('email','?')}\n"
+            f"   🏳️ Язык: {c.get('language','?')} | "
+            f"Статус: {c.get('status','?')}\n"
+            f"   ⚠️ Флаги: {c.get('suspicious_count',0)} | "
             f"Таймауты: {c.get('timeout_count',0)}\n"
+            f"   {verdict_line}\n"
         )
 
-    await message.answer(summary, parse_mode=ParseMode.HTML)
+    # CSV
+    output = io.StringIO()
+    fieldnames = [
+        "id", "tg_id", "name", "email", "role", "language",
+        "turn_count", "suspicious_count", "timeout_count",
+        "status", "created_at"
+    ]
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+    for c in candidates:
+        writer.writerow({k: c.get(k, "") for k in fieldnames})
 
-    from aiogram.types import BufferedInputFile
+    output.seek(0)
+    csv_bytes = output.getvalue().encode("utf-8-sig")  # utf-8-sig для Excel
+
+    await message.answer(summary, parse_mode=ParseMode.HTML)
     await message.answer_document(
-        BufferedInputFile(csv_bytes, filename="candidates.csv"),
-        caption="📁 Полный CSV-экспорт"
+        BufferedInputFile(csv_bytes, filename="auditcore_candidates.csv"),
+        caption="📁 CSV-экспорт (открывается в Excel)"
     )
 
 
 # ───────────────────────────────────────────────
-# ВЕБ-СЕРВЕР ДЛЯ RENDER (keep-alive)
+# ВЕБ-СЕРВЕР ДЛЯ RENDER
 # ───────────────────────────────────────────────
 
 async def handle_web(request):
-    return web.Response(text="AuditCore AI is running ✅")
+    return web.Response(text="AuditCore AI ✅ Running")
 
 async def start_web_server():
     app = web.Application()
@@ -428,11 +490,11 @@ async def start_web_server():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    logger.info(f"Web server started on port {PORT}")
+    logger.info(f"Web server on port {PORT}")
 
 
 # ───────────────────────────────────────────────
-# ТОЧКА ВХОДА
+# ЗАПУСК
 # ───────────────────────────────────────────────
 
 async def main():
@@ -444,3 +506,12 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+  
+      
+
+   
+
+
+  
+  
+        
